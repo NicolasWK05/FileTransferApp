@@ -1,7 +1,93 @@
 ﻿@page "/"
+@rendermode InteractiveServer
+@using System.Security.Cryptography
+@inject AesHandler AesHandler
+@inject FileUploadAppClient Client
 
-<PageTitle>Home</PageTitle>
+<PageTitle>Fil overførsel app</PageTitle>
+<h1>Fil overførsel app</h1>
 
-<h1>Hello, world!</h1>
+<InputFile OnChange="OnFileSelected" />
 
-Welcome to your new app.
+@if (statusMessage is not null)
+{
+    <p>@statusMessage</p>
+}
+
+<button class="btn btn-primary" @onclick="SendAsync" disabled="@(selectedFile is null || isBusy)">
+    @(isBusy ? "Sending..." : "Send")
+</button>
+
+@code {
+    private const long MaxFileSizeBytes = 50 * 1024 * 1024; // 50 MB
+
+    private IBrowserFile? selectedFile;
+    private string? statusMessage;
+    private bool isBusy;
+
+    private void OnFileSelected(InputFileChangeEventArgs e)
+    {
+        selectedFile = e.File;
+        statusMessage = null;
+    }
+
+    private async Task SendAsync()
+    {
+        if (selectedFile is null)
+            return;
+
+        isBusy = true;
+        statusMessage = null;
+
+        try
+        {
+            // Read the picked file straight into memory - it is never
+            // written to disk in plaintext before being encrypted.
+            using var stream = selectedFile.OpenReadStream(MaxFileSizeBytes);
+            using var memoryStream = new MemoryStream();
+            await stream.CopyToAsync(memoryStream);
+            var plainBytes = memoryStream.ToArray();
+
+            // STEP 1: fetch the receiving app's RSA public key. The HttpClient
+            // is certificate-pinned (see Program.cs) - that's what actually
+            // defends this exchange against a man-in-the-middle swapping in a
+            // fake key.
+            var publicKeyPem = await Client.GetPublicKeyPemAsync();
+
+            // STEP 2: AES-GCM encrypt the file content with a fresh, random,
+            // one-time AES key.
+            var encrypted = AesHandler.Encrypt(plainBytes);
+
+            // STEP 3: RSA-OAEP encrypt the (small) AES key using the
+            // receiving app's public key. OAEP padding is required here -
+            // the legacy PKCS#1 v1.5 padding is vulnerable to padding-oracle
+            // attacks and must not be used.
+            using var rsa = RSA.Create();
+            rsa.ImportFromPem(publicKeyPem);
+            var encryptedAesKey = rsa.Encrypt(encrypted.Key, RSAEncryptionPadding.OaepSHA256);
+
+            var request = new EncryptedFileUploadRequest(
+                FileName: selectedFile.Name,
+                FileType: selectedFile.ContentType,
+                EncryptedAesKeyBase64: Convert.ToBase64String(encryptedAesKey),
+                NonceBase64: Convert.ToBase64String(encrypted.Nonce),
+                TagBase64: Convert.ToBase64String(encrypted.Tag),
+                CipherTextBase64: Convert.ToBase64String(encrypted.CipherText));
+
+            // STEP 4: send the encrypted package to the receiving app.
+            var ok = await Client.SendEncryptedFileAsync(request);
+            statusMessage = ok ? "Upload successful!" : "Upload failed.";
+
+            if (ok)
+                selectedFile = null;
+        }
+        catch (Exception ex)
+        {
+            statusMessage = $"Error: {ex.Message}";
+        }
+        finally
+        {
+            isBusy = false;
+        }
+    }
+}
